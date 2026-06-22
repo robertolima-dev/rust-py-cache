@@ -1,6 +1,6 @@
 [package]
 name = "rust_py_cache"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 # Biblioteca de extensão para Python:

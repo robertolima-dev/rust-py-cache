@@ -2,113 +2,116 @@
 
 > **An ultra-fast local cache for Python, powered by Rust.**
 
-Cache local, em memória, thread-safe, com TTL, expiração lazy e métricas. O core
-é escrito em Rust (PyO3 + maturin) com um `DashMap` concorrente; a API Python é
-mínima. É um "mini Redis local" que vive **dentro do processo** Python.
+A local, in-memory, thread-safe cache with TTL, lazy expiration, and metrics. The
+core is written in Rust (PyO3 + maturin) on top of a concurrent `DashMap`; the
+Python API is minimal. Think of it as a "mini Redis" living **inside** your Python
+process.
 
-[![status](https://img.shields.io/badge/status-v0.1%20MVP-orange)](./ROADMAP.md)
+[![PyPI](https://img.shields.io/pypi/v/rust-py-cache)](https://pypi.org/project/rust-py-cache/)
+[![Python](https://img.shields.io/pypi/pyversions/rust-py-cache)](https://pypi.org/project/rust-py-cache/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow)](./LICENSE)
 
-## Instalação
+## Installation
 
 ```bash
-pip install rust-py-cache   # (após publicação no PyPI — ver ROADMAP)
+pip install rust-py-cache
 ```
 
-Para desenvolver localmente (precisa de Rust + maturin):
+To work on it locally (requires Rust + maturin):
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install maturin pytest
-maturin develop          # compila o Rust e instala no venv
-pytest                   # roda os testes
+maturin develop          # compiles the Rust core and installs into the venv
+pytest                   # runs the tests
 ```
 
-## Uso
+## Usage
 
 ```python
 from rust_py_cache import Cache
 
 cache = Cache()
 
-cache.set("user:1", {"name": "Roberto"}, ttl=60)   # ttl em segundos
+cache.set("user:1", {"name": "Roberto"}, ttl=60)   # ttl in seconds
 user = cache.get("user:1")                          # {"name": "Roberto"}
 cache.get("missing", default=0)                     # 0
 
-cache.exists("user:1")        # True (considera TTL)
-cache.delete("user:1")        # True se removeu, False se não existia
-cache.len()                   # tamanho aproximado
-cache.keys()                  # lista de chaves
-cache.cleanup_expired()       # remove expirados; retorna nº removidos
-cache.clear()                 # remove tudo (mantém contadores)
+cache.exists("user:1")        # True (honors TTL)
+cache.delete("user:1")        # True if removed, False if absent
+cache.len()                   # approximate size
+cache.keys()                  # list of keys
+cache.cleanup_expired()       # remove expired entries; returns the count
+cache.clear()                 # remove everything (keeps counters)
 cache.stats()                 # {'hits', 'misses', 'sets', 'deletes', 'expired', 'size'}
 ```
 
-### Decorator de memoização
+### Memoization decorator
 
 ```python
 @cache.cached(ttl=60)
-def soma(a, b):
+def add(a, b):
     return a + b
 
-soma(2, 3)   # executa e cacheia
-soma(2, 3)   # vem do cache
+add(2, 3)   # runs and caches
+add(2, 3)   # served from cache
 
-# chave customizada (string fixa ou callable):
+# custom key (fixed string or callable):
 @cache.cached(ttl=300, key=lambda user_id: f"user:{user_id}")
 def load_user(user_id):
     ...
 ```
 
-Veja exemplos completos em [`examples/`](./examples) (FastAPI e Django).
+See full examples under [`examples/`](./examples) (FastAPI and Django).
 
 ## API
 
-| Método | Descrição |
+| Method | Description |
 |---|---|
-| `set(key, value, ttl=None)` | Grava. `ttl` em segundos (`int`/`float`); `None` = sem expiração; `ttl <= 0` → `ValueError`. Sobrescreve. |
-| `get(key, default=None)` | Valor, ou `default` se ausente/expirado (remove se expirado). |
-| `delete(key)` | `True` se removeu, `False` se não existia. |
-| `exists(key)` | `True`/`False`, considerando TTL. |
-| `keys()` | Lista de chaves (pode conter expiradas não coletadas). |
-| `len()` / `len(cache)` | Tamanho aproximado. |
-| `clear()` | Remove tudo (não zera contadores). |
-| `cleanup_expired()` | Remove expirados; retorna quantos. |
-| `stats()` | `dict` com `hits, misses, sets, deletes, expired, size`. |
-| `@cache.cached(ttl=None, key=None)` | Decorator de memoização. |
+| `set(key, value, ttl=None)` | Store a value. `ttl` in seconds (`int`/`float`); `None` = no expiration; `ttl <= 0` → `ValueError`. Overwrites. |
+| `get(key, default=None)` | The value, or `default` if missing/expired (expired entries are removed). |
+| `delete(key)` | `True` if removed, `False` if it didn't exist. |
+| `exists(key)` | `True`/`False`, honoring TTL. |
+| `keys()` | List of keys (may include expired-but-not-yet-collected ones). |
+| `len()` / `len(cache)` | Approximate size. |
+| `clear()` | Remove everything (does not reset counters). |
+| `cleanup_expired()` | Remove expired entries; returns how many. |
+| `stats()` | `dict` with `hits, misses, sets, deletes, expired, size`. |
+| `@cache.cached(ttl=None, key=None)` | Memoization decorator. |
 
-## Como funciona
+## How it works
 
-- **Serialização:** no MVP o valor é serializado com `pickle` (do lado do Python,
-  via PyO3) e guardado como bytes opacos (`Vec<u8>`) no core Rust.
-- **Concorrência:** `DashMap` (HashMap com lock por shard) + contadores `AtomicU64`,
-  sem lock global no caminho quente. Thread-safe sem busy loop.
-- **TTL:** expiração **lazy** — uma chave expirada é removida ao ser acessada
-  (`get`/`exists`) ou em `cleanup_expired()`. Não há thread de background no MVP.
+- **Serialization:** in the MVP, values are serialized with `pickle` (on the Python
+  side, via PyO3) and stored as opaque bytes (`Vec<u8>`) in the Rust core.
+- **Concurrency:** `DashMap` (a HashMap with per-shard locks) plus `AtomicU64`
+  counters, with no global lock on the hot path. Thread-safe, no busy loop.
+- **TTL:** expiration is **lazy** — an expired key is removed when accessed
+  (`get`/`exists`) or via `cleanup_expired()`. There is no background thread in the MVP.
 
-## Limitações
+## Limitations
 
-- Cache é **local ao processo**: múltiplos workers = múltiplos caches independentes.
-- **Não** substitui Redis para cache distribuído.
-- Dados são **perdidos** ao reiniciar o processo.
-- `pickle` **não** deve ser usado para desserializar dados não confiáveis.
-- TTL lazy: itens expirados podem permanecer até serem acessados ou até `cleanup_expired()`.
+- The cache is **process-local**: multiple workers = multiple independent caches.
+- It does **not** replace Redis for distributed caching.
+- Data is **lost** when the process restarts.
+- `pickle` must **not** be used to deserialize untrusted data.
+- Lazy TTL: expired items may linger until accessed or until `cleanup_expired()`.
 
-## Desenvolvimento
+## Development
 
 ```bash
-cargo test          # testes do core Rust
-maturin develop     # recompila e instala
-pytest              # testes Python
+cargo test          # Rust core tests
+maturin develop     # rebuild and install
+pytest              # Python tests
 ```
 
-> Se `maturin develop` reclamar de `VIRTUAL_ENV` e `CONDA_PREFIX` setados ao mesmo
-> tempo, rode `conda deactivate` antes, ou use `env -u CONDA_PREFIX maturin develop`.
+> If `maturin develop` complains about both `VIRTUAL_ENV` and `CONDA_PREFIX` being
+> set, run `conda deactivate` first, or use `env -u CONDA_PREFIX maturin develop`.
 
 ## Roadmap
 
-Etapas e próximos passos (eviction LRU/LFU, expiração em background, serializer
-configurável, namespaces, etc.) em [ROADMAP.md](./ROADMAP.md).
+Stages and next steps (LRU/LFU eviction, background expiration, configurable
+serializer, namespaces, etc.) are in [ROADMAP.md](./ROADMAP.md).
 
-## Licença
+## License
 
 MIT
