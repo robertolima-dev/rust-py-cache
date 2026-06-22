@@ -1,0 +1,31 @@
+[package]
+name = "rust_py_cache"
+version = "0.1.0"
+edition = "2021"
+
+# Biblioteca de extensão para Python:
+#   - crate-type = ["cdylib"]  -> gera um .so/.dylib carregável pelo Python
+#   - name = "_rust_py_cache"  -> nome do módulo nativo (importado pelo __init__.py)
+[lib]
+name = "_rust_py_cache"
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3-py310: compila contra a Stable ABI do CPython 3.10+, gerando uma única
+# wheel compatível com 3.10, 3.11, 3.12, 3.13...
+# extension-module: não linka o binário do Python (o interpretador resolve em runtime).
+pyo3 = { version = "0.24", features = ["abi3-py310", "extension-module"] }
+
+# DashMap: HashMap concorrente (lock por shard). Permite get/set de várias threads
+# Python sem um Mutex global no caminho crítico. Usado pelo RustCache (Etapa 4).
+dashmap = "6"
+
+# thiserror: deriva o trait std::error::Error para nossos erros (errors.rs),
+# que depois convertemos em exceções Python.
+thiserror = "2"
+
+# --- Reservado para a v0.2 (NÃO incluso ainda para evitar dependência morta) ---
+# serde       = { version = "1", features = ["derive"] }  # serializer JSON
+# serde_json  = "1"                                         # serializer JSON
+# No MVP o TTL usa std::time::SystemTime (epoch em ms), então o crate `time`
+# também não é necessário ainda.
