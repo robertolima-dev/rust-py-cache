@@ -45,7 +45,28 @@ cache.len()                   # approximate size
 cache.keys()                  # list of keys
 cache.cleanup_expired()       # remove expired entries; returns the count
 cache.clear()                 # remove everything (keeps counters)
-cache.stats()                 # {'hits', 'misses', 'sets', 'deletes', 'expired', 'size'}
+cache.stats()                 # {'hits','misses','sets','deletes','expired','evicted','size'}
+```
+
+### Bounded cache with LRU eviction
+
+```python
+# Cap the number of keys. When full and a new key arrives, evict the
+# least-recently-used entry instead of rejecting the write.
+cache = Cache(max_size=1000, eviction_policy="lru")
+cache.eviction_policy            # "lru"
+
+# Default policy is "reject": set() returns False when full (and the key is new).
+cache = Cache(max_size=1000)     # eviction_policy="reject"
+cache.set("a", 1)                # True / False
+```
+
+### Background expiration
+
+```python
+# A background thread reclaims expired entries every N seconds, so you don't
+# have to call cleanup_expired() yourself. It stops when the cache is collected.
+cache = Cache(cleanup_interval=30)   # seconds (int/float)
 ```
 
 ### Memoization decorator
@@ -68,9 +89,13 @@ See full examples under [`examples/`](./examples) (FastAPI and Django).
 
 ## API
 
+Constructor: `Cache(max_size=None, eviction_policy="reject", cleanup_interval=None)`.
+`eviction_policy` must be `"reject"` or `"lru"` (any other value raises
+`ValueError`). `cleanup_interval` (seconds, `> 0`) enables the background sweeper.
+
 | Method | Description |
 |---|---|
-| `set(key, value, ttl=None)` | Store a value. `ttl` in seconds (`int`/`float`); `None` = no expiration; `ttl <= 0` → `ValueError`. Overwrites. |
+| `set(key, value, ttl=None)` | Store a value. `ttl` in seconds (`int`/`float`); `None` = no expiration; `ttl <= 0` → `ValueError`. Overwrites. Returns `True`, or `False` when full under `eviction_policy="reject"` and the key is new. |
 | `get(key, default=None)` | The value, or `default` if missing/expired (expired entries are removed). |
 | `delete(key)` | `True` if removed, `False` if it didn't exist. |
 | `exists(key)` | `True`/`False`, honoring TTL. |
@@ -78,7 +103,8 @@ See full examples under [`examples/`](./examples) (FastAPI and Django).
 | `len()` / `len(cache)` | Approximate size. |
 | `clear()` | Remove everything (does not reset counters). |
 | `cleanup_expired()` | Remove expired entries; returns how many. |
-| `stats()` | `dict` with `hits, misses, sets, deletes, expired, size`. |
+| `eviction_policy` (property) | The active policy: `"reject"` or `"lru"`. |
+| `stats()` | `dict` with `hits, misses, sets, deletes, expired, evicted, size`. |
 | `@cache.cached(ttl=None, key=None)` | Memoization decorator. |
 
 ## How it works
@@ -87,8 +113,11 @@ See full examples under [`examples/`](./examples) (FastAPI and Django).
   side, via PyO3) and stored as opaque bytes (`Vec<u8>`) in the Rust core.
 - **Concurrency:** `DashMap` (a HashMap with per-shard locks) plus `AtomicU64`
   counters, with no global lock on the hot path. Thread-safe, no busy loop.
-- **TTL:** expiration is **lazy** — an expired key is removed when accessed
-  (`get`/`exists`) or via `cleanup_expired()`. There is no background thread in the MVP.
+- **TTL:** expiration is **lazy** by default — an expired key is removed when
+  accessed (`get`/`exists`) or via `cleanup_expired()`. Pass `cleanup_interval` to
+  also run a **background** sweeper thread that reclaims expired keys on its own.
+- **Eviction:** with `max_size` + `eviction_policy="lru"`, a full cache evicts the
+  least-recently-used entry (recency updated on every `get` hit) to admit a new key.
 
 ## Limitations
 
@@ -96,7 +125,8 @@ See full examples under [`examples/`](./examples) (FastAPI and Django).
 - It does **not** replace Redis for distributed caching.
 - Data is **lost** when the process restarts.
 - `pickle` must **not** be used to deserialize untrusted data.
-- Lazy TTL: expired items may linger until accessed or until `cleanup_expired()`.
+- Lazy TTL by default: without `cleanup_interval`, expired items may linger until
+  accessed or until `cleanup_expired()` runs.
 
 ## Development
 

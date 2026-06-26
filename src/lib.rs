@@ -6,13 +6,18 @@
 mod cache;
 mod entry;
 mod stats;
+mod sweeper;
 mod ttl;
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
-use crate::cache::RustCache;
+use crate::cache::{EvictionPolicy, RustCache};
+use crate::sweeper::Sweeper;
 use crate::ttl::{expires_at_from_ttl, now_ms};
 
 /// Serializa um objeto Python em bytes via `pickle.dumps`.
@@ -57,19 +62,61 @@ fn hello() -> PyResult<String> {
 ///   adiciona o decorator `@cache.cached` (ver `python/.../decorators.py`).
 #[pyclass(subclass)]
 pub struct Cache {
-    inner: RustCache,
+    inner: Arc<RustCache>,
+    /// Thread de expiração em background (quando `cleanup_interval` é dado).
+    /// Mantida viva junto com o `Cache`; encerrada no `Drop`. O `_` evita o aviso
+    /// de campo não lido — seu efeito é o ciclo de vida, não a leitura.
+    _sweeper: Option<Sweeper>,
 }
 
 #[pymethods]
 impl Cache {
-    /// `Cache()` — cria um cache vazio.
+    /// `Cache(max_size=None, eviction_policy="reject", cleanup_interval=None)`.
     ///
-    /// `#[new]` marca o construtor. Devolver `Self` basta: o PyO3 embrulha o
-    /// valor Rust no objeto Python.
+    /// - `max_size`: limite de chaves (`None` = ilimitado).
+    /// - `eviction_policy`: `"reject"` (padrão) ou `"lru"` (remove a menos
+    ///   recentemente usada ao encher). Outro valor levanta `ValueError`.
+    /// - `cleanup_interval`: se `> 0`, liga uma thread que varre expirados a cada
+    ///   N segundos (expiração em background, além da preguiçosa por acesso).
     #[new]
-    fn new() -> Self {
-        Cache {
-            inner: RustCache::new(),
+    #[pyo3(signature = (max_size=None, eviction_policy="reject", cleanup_interval=None))]
+    fn new(
+        max_size: Option<usize>,
+        eviction_policy: &str,
+        cleanup_interval: Option<f64>,
+    ) -> PyResult<Self> {
+        let policy = match eviction_policy {
+            "reject" => EvictionPolicy::Reject,
+            "lru" => EvictionPolicy::Lru,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "eviction_policy deve ser \"reject\" ou \"lru\", recebido {other:?}"
+                )));
+            }
+        };
+
+        let inner = Arc::new(RustCache::new(max_size, policy));
+
+        let sweeper = match cleanup_interval {
+            Some(secs) if secs > 0.0 => Some(Sweeper::start(
+                &inner,
+                Duration::from_millis((secs * 1000.0) as u64),
+            )),
+            _ => None,
+        };
+
+        Ok(Cache {
+            inner,
+            _sweeper: sweeper,
+        })
+    }
+
+    /// A política de evicção ativa: `"reject"` ou `"lru"`.
+    #[getter]
+    fn eviction_policy(&self) -> &'static str {
+        match self.inner.eviction_policy() {
+            EvictionPolicy::Reject => "reject",
+            EvictionPolicy::Lru => "lru",
         }
     }
 
@@ -84,6 +131,9 @@ impl Cache {
     ///   seguramos o GIL — necessário para chamar `pickle`.
     /// - `value: &Bound<'_, PyAny>` é qualquer objeto Python, emprestado.
     /// - `#[pyo3(signature = ...)]` define o default `ttl=None` visível no Python.
+    /// Devolve `True` quando a entrada foi gravada; `False` apenas quando há
+    /// `max_size` com `eviction_policy="reject"`, a chave é nova e o cache está
+    /// cheio. Sobrescrever uma chave existente sempre devolve `True`.
     #[pyo3(signature = (key, value, ttl=None))]
     fn set(
         &self,
@@ -91,13 +141,12 @@ impl Cache {
         key: String,
         value: &Bound<'_, PyAny>,
         ttl: Option<f64>,
-    ) -> PyResult<()> {
+    ) -> PyResult<bool> {
         let now = now_ms();
         let expires_at = expires_at_from_ttl(ttl, now)
             .map_err(|_| PyValueError::new_err("ttl deve ser > 0 (ou None para não expirar)"))?;
         let bytes = dumps(py, value)?;
-        self.inner.set(key, bytes, expires_at, now);
-        Ok(())
+        Ok(self.inner.set(key, bytes, expires_at, now))
     }
 
     /// `get(key, default=None)` — devolve o valor de `key`.
@@ -147,6 +196,7 @@ impl Cache {
         d.set_item("sets", s.sets)?;
         d.set_item("deletes", s.deletes)?;
         d.set_item("expired", s.expired)?;
+        d.set_item("evicted", s.evicted)?;
         d.set_item("size", self.inner.len())?;
         Ok(d)
     }

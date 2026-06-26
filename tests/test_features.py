@@ -56,7 +56,15 @@ def test_stats_tracks_operations():
     assert s["misses"] == 1
     assert s["deletes"] == 1
     assert s["size"] == 0
-    assert set(s) == {"hits", "misses", "sets", "deletes", "expired", "size"}
+    assert set(s) == {
+        "hits",
+        "misses",
+        "sets",
+        "deletes",
+        "expired",
+        "evicted",
+        "size",
+    }
 
 
 def test_decorator_caches_calls():

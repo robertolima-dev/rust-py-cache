@@ -8,7 +8,7 @@ the stages already shipped and what comes next.
 
 ---
 
-## Shipped — v0.1.x (current: 0.1.2)
+## Shipped — current: 0.2.0
 
 - ✅ `Cache` with `set` / `get(default=...)` / `delete` / `exists` / `keys` /
   `len` / `clear` / `cleanup_expired` / `stats`.
@@ -24,23 +24,25 @@ the stages already shipped and what comes next.
 
 ---
 
+## Shipped — v0.2.0
+
+### Background expiration
+
+- ✅ Opt-in background sweeper thread via `Cache(cleanup_interval=...)` (seconds),
+  reclaiming expired entries proactively instead of relying only on lazy
+  expiration / manual `cleanup_expired()`. The thread is tied to the cache's
+  lifetime (stops on `Drop`) and sleeps in short slices for responsive shutdown.
+
+### LRU eviction
+
+- ✅ `Cache(max_size=..., eviction_policy="lru")` evicts the **least-recently-used**
+  entry once the cap is hit (recency updated on every `get` hit). Default policy
+  is `"reject"` (backward compatible). Evictions are surfaced in `stats()` as an
+  `evicted` counter.
+
 ## Planned
 
-### v0.2 — Background expiration
-
-- 🔜 Optional background sweeper thread to reclaim expired entries proactively,
-  configurable via the constructor (e.g. `Cache(cleanup_interval=...)`), instead
-  of relying only on lazy expiration / manual `cleanup_expired()`.
-- 🔜 Keep the sweeper opt-in and lock-friendly (sweep shard by shard) so it never
-  stalls the hot path.
-
-### v0.3 — LRU eviction
-
-- 🔜 `Cache(max_size=...)` with **least-recently-used** eviction once the cap is hit.
-- 🔜 Track recency cheaply (avoid a global lock); surface evictions in `stats()`
-  (e.g. an `evicted` counter).
-
-### v0.4 — LFU eviction
+### v0.3 — LFU eviction
 
 - 🔜 **Least-frequently-used** eviction policy as an alternative to LRU, selectable
   at construction time (e.g. `Cache(max_size=..., policy="lfu")`).

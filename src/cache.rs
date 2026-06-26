@@ -9,6 +9,16 @@ use dashmap::DashMap;
 use crate::entry::CacheEntry;
 use crate::stats::{CacheStats, StatsSnapshot};
 
+/// O que fazer quando `max_size` é atingido e chega uma chave **nova**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EvictionPolicy {
+    /// Rejeita a escrita (`set` devolve `false`). Comportamento padrão.
+    #[default]
+    Reject,
+    /// Remove a entrada menos recentemente usada (LRU) para abrir espaço.
+    Lru,
+}
+
 /// Núcleo concorrente do cache.
 ///
 /// `DashMap` é um `HashMap` thread-safe com *sharding*: ele divide o mapa em
@@ -19,18 +29,45 @@ use crate::stats::{CacheStats, StatsSnapshot};
 /// faz *interior mutability* — ele cuida da sincronização internamente, então
 /// não precisamos de `&mut self` nem de um `Mutex` por fora. As `stats` seguem
 /// a mesma ideia com `AtomicU64`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RustCache {
     store: DashMap<String, CacheEntry>,
     stats: CacheStats,
+    /// Limite opcional de número de chaves.
+    max_size: Option<usize>,
+    /// Política aplicada quando o cache enche e chega uma chave nova.
+    eviction_policy: EvictionPolicy,
 }
 
 impl RustCache {
-    /// Cria um cache vazio.
-    pub fn new() -> Self {
+    /// Cria um cache vazio. `max_size = None` => sem limite de chaves.
+    pub fn new(max_size: Option<usize>, eviction_policy: EvictionPolicy) -> Self {
         Self {
             store: DashMap::new(),
             stats: CacheStats::new(),
+            max_size,
+            eviction_policy,
+        }
+    }
+
+    /// A política de evicção configurada.
+    pub fn eviction_policy(&self) -> EvictionPolicy {
+        self.eviction_policy
+    }
+
+    /// Remove a entrada com o menor `last_accessed_at` (a "menos recentemente
+    /// usada"). Varre o mapa uma vez — O(n) só na evicção (caminho raro: cache
+    /// cheio + chave nova). Conta em `evicted`.
+    fn evict_lru(&self) {
+        let oldest = self
+            .store
+            .iter()
+            .min_by_key(|e| e.value().last_accessed_at)
+            .map(|e| e.key().clone());
+        if let Some(key) = oldest {
+            if self.store.remove(&key).is_some() {
+                self.stats.record_evicted();
+            }
         }
     }
 
@@ -39,10 +76,25 @@ impl RustCache {
     /// O core não sabe o que há nos bytes — quem serializa (pickle) é a camada
     /// `lib.rs`, do lado do Python. Aqui só montamos a `CacheEntry` e inserimos.
     /// `insert` no `DashMap` pega o lock só do shard daquela chave.
-    pub fn set(&self, key: String, value: Vec<u8>, expires_at: Option<u64>, now: u64) {
+    ///
+    /// Sobrescrever uma chave existente sempre é permitido. Para uma chave
+    /// **nova** com o cache cheio (`max_size`): com `Reject` devolve `false` sem
+    /// inserir; com `Lru` remove a entrada menos recentemente usada e prossegue.
+    /// Devolve `true` quando a entrada foi (ou seria) gravada.
+    pub fn set(&self, key: String, value: Vec<u8>, expires_at: Option<u64>, now: u64) -> bool {
+        if let Some(max) = self.max_size {
+            if self.store.len() >= max && !self.store.contains_key(&key) {
+                match self.eviction_policy {
+                    EvictionPolicy::Reject => return false,
+                    EvictionPolicy::Lru => self.evict_lru(),
+                }
+            }
+        }
+
         self.store
             .insert(key, CacheEntry::new(value, expires_at, now));
         self.stats.record_set();
+        true
     }
 
     /// Lê os bytes de `key`, aplicando **expiração lazy**.
@@ -57,7 +109,9 @@ impl RustCache {
     /// vivo, travaríamos o mesmo shard contra nós mesmos (deadlock). Por isso
     /// `drop(entry)` **antes** do `remove`.
     pub fn get(&self, key: &str, now: u64) -> Option<Vec<u8>> {
-        let Some(entry) = self.store.get(key) else {
+        // `get_mut` segura o lock de ESCRITA do shard: além de ler o valor,
+        // atualizamos `last_accessed_at`/`hits` (base do LRU) no mesmo acesso.
+        let Some(mut entry) = self.store.get_mut(key) else {
             self.stats.record_miss();
             return None;
         };
@@ -68,8 +122,11 @@ impl RustCache {
             self.stats.record_miss();
             return None;
         }
+        entry.last_accessed_at = now;
+        entry.hits += 1;
+        let value = entry.value.clone();
         self.stats.record_hit();
-        Some(entry.value.clone())
+        Some(value)
     }
 
     /// `true` se `key` existe e **não** está expirada. Coleta a chave se expirada.
@@ -166,7 +223,7 @@ mod tests {
 
     #[test]
     fn set_then_get_returns_value() {
-        let c = RustCache::new();
+        let c = RustCache::new(None, EvictionPolicy::Reject);
         c.set("a".into(), b"v".to_vec(), None, NOW);
         assert_eq!(c.get("a", NOW), Some(b"v".to_vec()));
         assert_eq!(c.len(), 1);
@@ -174,14 +231,14 @@ mod tests {
 
     #[test]
     fn get_missing_is_none_and_counts_miss() {
-        let c = RustCache::new();
+        let c = RustCache::new(None, EvictionPolicy::Reject);
         assert_eq!(c.get("x", NOW), None);
         assert_eq!(c.stats().misses, 1);
     }
 
     #[test]
     fn expired_get_collects_and_counts() {
-        let c = RustCache::new();
+        let c = RustCache::new(None, EvictionPolicy::Reject);
         c.set("a".into(), b"v".to_vec(), Some(NOW + 10), NOW);
         // ainda válido
         assert!(c.get("a", NOW + 5).is_some());
@@ -196,7 +253,7 @@ mod tests {
 
     #[test]
     fn exists_respects_ttl() {
-        let c = RustCache::new();
+        let c = RustCache::new(None, EvictionPolicy::Reject);
         c.set("a".into(), b"v".to_vec(), Some(NOW + 10), NOW);
         assert!(c.exists("a", NOW + 5));
         assert!(!c.exists("a", NOW + 20));
@@ -205,7 +262,7 @@ mod tests {
 
     #[test]
     fn delete_counts_only_real_removals() {
-        let c = RustCache::new();
+        let c = RustCache::new(None, EvictionPolicy::Reject);
         c.set("a".into(), b"v".to_vec(), None, NOW);
         assert!(c.delete("a"));
         assert!(!c.delete("a"));
@@ -214,7 +271,7 @@ mod tests {
 
     #[test]
     fn cleanup_removes_only_expired() {
-        let c = RustCache::new();
+        let c = RustCache::new(None, EvictionPolicy::Reject);
         c.set("keep".into(), b"v".to_vec(), None, NOW);
         c.set("gone".into(), b"v".to_vec(), Some(NOW + 10), NOW);
         let removed = c.cleanup_expired(NOW + 20);
@@ -222,5 +279,44 @@ mod tests {
         assert!(c.exists("keep", NOW + 20));
         assert!(!c.exists("gone", NOW + 20));
         assert_eq!(c.stats().expired, 1);
+    }
+
+    #[test]
+    fn reject_policy_blocks_new_keys_when_full() {
+        let c = RustCache::new(Some(2), EvictionPolicy::Reject);
+        assert!(c.set("a".into(), b"1".to_vec(), None, NOW));
+        assert!(c.set("b".into(), b"2".to_vec(), None, NOW));
+        // cheio + chave nova => rejeita, sem evicção
+        assert!(!c.set("c".into(), b"3".to_vec(), None, NOW));
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.stats().evicted, 0);
+        // sobrescrever chave existente é sempre permitido
+        assert!(c.set("a".into(), b"10".to_vec(), None, NOW));
+    }
+
+    #[test]
+    fn lru_policy_evicts_least_recently_used() {
+        let c = RustCache::new(Some(2), EvictionPolicy::Lru);
+        c.set("a".into(), b"1".to_vec(), None, NOW);
+        c.set("b".into(), b"2".to_vec(), None, NOW);
+        // Acessa "a" mais tarde: "b" vira a menos recentemente usada.
+        assert!(c.get("a", NOW + 5).is_some());
+        // Insere "c": remove "b" (LRU), mantém "a" e "c".
+        assert!(c.set("c".into(), b"3".to_vec(), None, NOW + 10));
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.stats().evicted, 1);
+        assert!(c.get("b", NOW + 11).is_none());
+        assert!(c.get("a", NOW + 11).is_some());
+        assert!(c.get("c", NOW + 11).is_some());
+    }
+
+    #[test]
+    fn no_max_size_never_evicts() {
+        let c = RustCache::new(None, EvictionPolicy::Lru);
+        for i in 0..50 {
+            c.set(format!("k{i}"), b"v".to_vec(), None, NOW);
+        }
+        assert_eq!(c.len(), 50);
+        assert_eq!(c.stats().evicted, 0);
     }
 }

@@ -18,6 +18,7 @@ pub struct CacheStats {
     pub sets: AtomicU64,
     pub deletes: AtomicU64,
     pub expired: AtomicU64,
+    pub evicted: AtomicU64,
 }
 
 /// Cópia "congelada" dos contadores num instante — fácil de mandar pro Python.
@@ -28,6 +29,7 @@ pub struct StatsSnapshot {
     pub sets: u64,
     pub deletes: u64,
     pub expired: u64,
+    pub evicted: u64,
 }
 
 impl CacheStats {
@@ -57,6 +59,11 @@ impl CacheStats {
         self.expired.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Conta uma entrada removida por evicção (política LRU ao atingir `max_size`).
+    pub fn record_evicted(&self) {
+        self.evicted.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {
             hits: self.hits.load(Ordering::Relaxed),
@@ -64,6 +71,7 @@ impl CacheStats {
             sets: self.sets.load(Ordering::Relaxed),
             deletes: self.deletes.load(Ordering::Relaxed),
             expired: self.expired.load(Ordering::Relaxed),
+            evicted: self.evicted.load(Ordering::Relaxed),
         }
     }
 }
