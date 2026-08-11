@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rust-py-cache"
-version = "0.2.1"
+version = "0.2.2"
 description = "An ultra-fast local cache for Python, powered by Rust."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,9 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "maturin>=1.7"]
+
 [project.urls]
 Homepage = "https://github.com/robertolima/rust-py-cache"
 
@@ -29,5 +32,6 @@ Homepage = "https://github.com/robertolima/rust-py-cache"
 python-source = "python"
 # Compila o .so como submódulo nativo dentro do pacote Python.
 module-name = "rust_py_cache._rust_py_cache"
-# Gera wheel abi3 (uma wheel para 3.10+).
-features = ["pyo3/extension-module"]
+# extension-module vem das features default do crate (ver Cargo.toml), então
+# não precisa ser repetido aqui — e repetir reativaria a feature mesmo num
+# build que pediu --no-default-features de propósito.

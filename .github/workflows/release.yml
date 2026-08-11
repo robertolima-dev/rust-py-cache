@@ -3,44 +3,140 @@ name: Release
 # Dispara ao publicar uma tag de versão (ex.: v0.1.0). Constrói as wheels para
 # todas as plataformas + sdist e publica no PyPI via Trusted Publishing (OIDC),
 # sem precisar guardar um token no repositório.
+#
+# O `ci.yml` roda em push/PR, mas é um workflow *separado*: um push de tag ia
+# direto para build e publicação sem depender dele. O job `test` abaixo é o que
+# torna a publicação condicionada a uma suíte verde — publicar no PyPI é
+# irreversível, então não pode acontecer sobre código não verificado.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    name: build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+  test:
+    name: Test (Rust + Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: cargo test
+        env:
+          PYO3_PYTHON: python
+        run: cargo test --no-default-features --lib
+      - name: Build, install the extension and run the Python tests
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pytest -q
+
+  # A matriz abaixo substitui um job `build` que rodava em ubuntu/macos/windows
+  # com `maturin build` puro. Aquilo publicava 3 wheels e o de Linux herdava a
+  # glibc do runner, em vez de passar pelo container manylinux. Quem estava em
+  # aarch64, em musl ou em Mac Intel caía no sdist — que exige toolchain Rust.
+  linux:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          # `auto` constrói dentro do container manylinux, então a wheel
+          # declara um piso de glibc portável em vez do da máquina de build.
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+
+  musllinux:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: musllinux_1_2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-musllinux-${{ matrix.target }}
+          path: dist
+
+  windows:
+    runs-on: windows-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
+          architecture: x64
+      - uses: PyO3/maturin-action@v1
         with:
-          command: build
+          target: x64
           args: --release --out dist
-      - name: Build sdist
-        if: matrix.os == 'ubuntu-latest'
-        uses: PyO3/maturin-action@v1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x64
+          path: dist
+
+  macos:
+    runs-on: macos-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist
       - uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.os }}
+          name: wheels-sdist
           path: dist
 
   publish:
     name: publish to PyPI
-    needs: build
+    # Guarda além do gatilho: sem ela, um `workflow_dispatch` a partir de um
+    # branch publicaria no PyPI.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [test, linux, musllinux, windows, macos, sdist]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -48,10 +144,89 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: dist-*
+          pattern: wheels-*
           merge-multiple: true
           path: dist
-      - name: Publish
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Conferência antes de qualquer coisa sair do runner: publicar um
+      # conjunto incompleto é pior que não publicar, porque o PyPI nunca deixa
+      # reusar um nome de arquivo — uma versão meio-publicada só pode ser
+      # completada, nunca substituída.
+      - name: Verify the artifact set is complete
+        run: |
+          set -euo pipefail
+          ls -la dist/
+          test -n "$(find dist -name '*.tar.gz' -print -quit)" \
+            || { echo "::error::sdist ausente — abortando antes de publicar"; exit 1; }
+          wheels=$(find dist -name '*.whl' | wc -l)
+          echo "wheels: $wheels"
+          test "$wheels" -ge 7 \
+            || { echo "::error::só $wheels wheels; esperado >= 7 (2 linux, 2 musl, 1 win, 2 macos)"; exit 1; }
+
+      # O PyPI devolve 500 transitório com frequência suficiente para importar,
+      # e o upload é arquivo por arquivo: uma falha no meio deixa a versão
+      # publicada pela metade. `skip-existing` é o que torna a segunda
+      # tentativa segura — sem ele, ela morre nos arquivos que já subiram.
+      #
+      # São dois passos explícitos em vez de um wrapper de retry porque o
+      # trusted publishing (OIDC) exige a action oficial, que não dá para
+      # acionar por linha de comando.
+      - name: Publish to PyPI (attempt 1)
+        id: publish1
+        continue-on-error: true
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          skip-existing: true
+
+      - name: Wait before retrying
+        if: steps.publish1.outcome == 'failure'
+        run: sleep 45
+
+      - name: Publish to PyPI (attempt 2)
+        if: steps.publish1.outcome == 'failure'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+
+      # Prova que a release está completa, em vez de confiar num código de
+      # saída que uma publicação parcial também produz.
+      - name: Verify every file reached PyPI
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import os, sys, glob, time, requests
+          version = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          # Só .whl e .tar.gz: são os únicos tipos de arquivo que o PyPI hospeda.
+          # `pypa/gh-action-pypi-publish` deixa um .publish.attestation por
+          # distribuição em dist/ depois de publicar (atestados PEP 740, que
+          # sobem junto do arquivo, não como arquivo próprio). Um glob amplo os
+          # conta como "faltando no PyPI" e reprova uma release que deu certo.
+          local = {
+              os.path.basename(p)
+              for pattern in ("dist/*.whl", "dist/*.tar.gz")
+              for p in glob.glob(pattern)
+          }
+          url = f"https://pypi.org/pypi/rust-py-cache/{version}/json"
+          for attempt in range(6):          # a API JSON do PyPI é cacheada
+              response = requests.get(url, timeout=30)
+              if response.status_code == 200:
+                  remote = {f["filename"] for f in response.json()["urls"]}
+                  missing = local - remote
+                  if not missing:
+                      print(f"OK: {len(remote)} arquivos publicados na {version}")
+                      sys.exit(0)
+              else:
+                  missing = local
+              print(f"tentativa {attempt + 1}: faltam {len(missing)}")
+              time.sleep(20)
+          print("::error::faltaram arquivos no PyPI:")
+          for name in sorted(missing):
+              print(f"  - {name}")
+          sys.exit(1)
+          PY

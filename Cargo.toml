@@ -1,20 +1,28 @@
 [package]
 name = "rust_py_cache"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 
 # Biblioteca de extensão para Python:
-#   - crate-type = ["cdylib"]  -> gera um .so/.dylib carregável pelo Python
+#   - cdylib -> gera o .so/.dylib carregável pelo Python
+#   - rlib   -> alvo de biblioteca normal, que o `cargo test` usa para montar
+#               o harness de teste
 #   - name = "_rust_py_cache"  -> nome do módulo nativo (importado pelo __init__.py)
 [lib]
 name = "_rust_py_cache"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # abi3-py310: compila contra a Stable ABI do CPython 3.10+, gerando uma única
 # wheel compatível com 3.10, 3.11, 3.12, 3.13...
-# extension-module: não linka o binário do Python (o interpretador resolve em runtime).
-pyo3 = { version = "0.24", features = ["abi3-py310", "extension-module"] }
+#
+# extension-module NÃO fica aqui: ele manda o linker deixar os símbolos da
+# libpython indefinidos, o que é correto para a wheel mas frágil para o binário
+# de teste no Linux (o macOS tolera com -undefined dynamic_lookup). Vive em
+# [features] no fim do arquivo, ligado por padrão, para que
+# `cargo test --no-default-features` possa desligá-lo. É o mesmo arranjo dos
+# outros quatro projetos.
+pyo3 = { version = "0.24", features = ["abi3-py310"] }
 
 # DashMap: HashMap concorrente (lock por shard). Permite get/set de várias threads
 # Python sem um Mutex global no caminho crítico. Usado pelo RustCache (Etapa 4).
@@ -29,3 +37,10 @@ thiserror = "2"
 # serde_json  = "1"                                         # serializer JSON
 # No MVP o TTL usa std::time::SystemTime (epoch em ms), então o crate `time`
 # também não é necessário ainda.
+
+[features]
+# maturin constrói com as features default (a wheel ganha extension-module);
+# a CI roda `cargo test --no-default-features --lib` para obter um binário de
+# teste que consegue linkar contra a libpython.
+extension-module = ["pyo3/extension-module"]
+default = ["extension-module"]
