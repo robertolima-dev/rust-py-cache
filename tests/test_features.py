@@ -1,5 +1,6 @@
 """Testes de exists/keys/stats/cleanup_expired/clear e decorator — Etapas 8-17."""
 
+import asyncio
 import time
 
 from rust_py_cache import Cache
@@ -110,3 +111,63 @@ def test_decorator_caches_none_result():
     assert returns_none() is None
     assert returns_none() is None
     assert calls["n"] == 1  # None foi cacheado, não recomputou
+
+
+def test_decorator_caches_async_function():
+    """P0-2: `@cached` sobre `async def` deve cachear o RESULTADO do await.
+
+    Antes da correção, o wrapper síncrono guardava o objeto coroutine: a
+    primeira chamada devolvia o valor certo e a segunda levantava
+    `RuntimeError: cannot reuse already awaited coroutine`.
+    """
+    cache = Cache()
+    calls = {"n": 0}
+
+    @cache.cached(ttl=60)
+    async def busca(x):
+        calls["n"] += 1
+        return x * 2
+
+    async def cenario():
+        # Duas chamadas no mesmo event loop — é aqui que o bug aparecia.
+        primeira = await busca(21)
+        segunda = await busca(21)
+        terceira = await busca(10)  # args diferentes -> recomputa
+        return primeira, segunda, terceira
+
+    primeira, segunda, terceira = asyncio.run(cenario())
+
+    assert primeira == 42
+    assert segunda == 42
+    assert terceira == 20
+    assert calls["n"] == 2  # busca(21) rodou uma vez só
+
+
+def test_decorator_async_keeps_coroutine_function():
+    """O wrapper de uma `async def` continua sendo uma coroutine function."""
+    cache = Cache()
+
+    @cache.cached()
+    async def f():
+        return 1
+
+    assert asyncio.iscoroutinefunction(f)
+    assert f.__name__ == "f"
+
+
+def test_decorator_async_caches_none_result():
+    cache = Cache()
+    calls = {"n": 0}
+
+    @cache.cached()
+    async def returns_none():
+        calls["n"] += 1
+        return None
+
+    async def cenario():
+        return await returns_none(), await returns_none()
+
+    a, b = asyncio.run(cenario())
+    assert a is None
+    assert b is None
+    assert calls["n"] == 1

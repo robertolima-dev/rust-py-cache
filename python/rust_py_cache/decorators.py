@@ -6,6 +6,7 @@ chave e `functools.wraps` — tudo muito mais natural aqui.
 """
 
 import functools
+import inspect
 
 # Sentinela para distinguir "ausente no cache" de "valor None legítimo".
 # `cache.get(key, _MISSING)` devolve `_MISSING` só quando a chave não existe.
@@ -37,25 +38,52 @@ def cached(self, ttl=None, key=None):
         @cache.cached(ttl=60)
         def soma(a, b):
             return a + b
+
+        @cache.cached(ttl=60)
+        async def busca(id):
+            return await api.get(id)
+
+    Funções `async def` são detectadas e recebem um wrapper `async`, que guarda
+    no cache o resultado do `await` — não o objeto coroutine. Cachear a coroutine
+    faria a segunda chamada levantar `RuntimeError: cannot reuse already awaited
+    coroutine`.
     """
 
+    def _resolve_key(func, args, kwargs):
+        if key is None:
+            return _default_key(func, args, kwargs)
+        if callable(key):
+            return key(*args, **kwargs)
+        return key
+
     def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            if key is None:
-                cache_key = _default_key(func, args, kwargs)
-            elif callable(key):
-                cache_key = key(*args, **kwargs)
-            else:
-                cache_key = key
+        if inspect.iscoroutinefunction(func):
 
-            hit = self.get(cache_key, _MISSING)
-            if hit is not _MISSING:
-                return hit
+            @functools.wraps(func)
+            async def wrapper(*args, **kwargs):
+                cache_key = _resolve_key(func, args, kwargs)
 
-            result = func(*args, **kwargs)
-            self.set(cache_key, result, ttl=ttl)
-            return result
+                hit = self.get(cache_key, _MISSING)
+                if hit is not _MISSING:
+                    return hit
+
+                result = await func(*args, **kwargs)
+                self.set(cache_key, result, ttl=ttl)
+                return result
+
+        else:
+
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                cache_key = _resolve_key(func, args, kwargs)
+
+                hit = self.get(cache_key, _MISSING)
+                if hit is not _MISSING:
+                    return hit
+
+                result = func(*args, **kwargs)
+                self.set(cache_key, result, ttl=ttl)
+                return result
 
         # Expõe a chave-base para inspeção/invalidação manual em testes.
         wrapper.__wrapped__ = func
