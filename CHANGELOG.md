@@ -5,6 +5,37 @@ Todas as mudanças relevantes deste projeto são registradas aqui.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e o versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
 
+## [0.2.3] — não publicada
+
+Versão de empacotamento e qualidade: nada muda no comportamento da biblioteca.
+
+### Adicionado
+
+- **`LICENSE`** (MIT). O projeto declarava MIT no `pyproject.toml` desde sempre,
+  mas o texto da licença não existia no repositório nem na wheel (**P1-4**).
+- **`clippy.toml` e `Makefile`** compartilhados com os outros quatro `rust_py_*`,
+  e um job `lint` (`cargo fmt --check` + `cargo clippy -D warnings`) no `ci.yml`
+  e no `release.yml` — este barrando a publicação, como o `test` já barrava
+  (**P1-6**). O `cargo clippy` já estava limpo aqui; foi o único dos cinco.
+
+### Corrigido
+
+- **Metadado de licença ausente no PyPI.** O `pyproject.toml` usava
+  `license = { text = "MIT" }`, forma legada que o Metadata 2.4 depreca. Passou
+  para a do PEP 639 (`license = "MIT"` + `license-files = ["LICENSE"]`), e o
+  classifier `License :: OSI Approved` saiu — ele é mutuamente exclusivo com
+  `License-Expression`. A 0.2.2 no PyPI mostra `license: MIT` no campo legado e
+  `license_expression: null`; a partir daqui é o contrário, que é o correto.
+
+- **Piso da maturin subiu para 1.14** no `[build-system]`. Era `>=1.7`, e
+  versões anteriores não emitem `License-Expression` — foi essa, e não a forma
+  no `pyproject`, a causa raiz do metadado faltando.
+
+### Declarado como Cargo
+
+- `Cargo.toml` não tinha campo `license` nenhum. Agora tem `license = "MIT"`,
+  como os outros quatro.
+
 ## [0.2.2] - 2026-08-11
 
 Release de infraestrutura: nada muda no comportamento da biblioteca, mas muda

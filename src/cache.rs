@@ -187,7 +187,11 @@ impl RustCache {
 
         let mut removed = 0u64;
         for key in expired {
-            if self.store.remove_if(&key, |_, v| v.is_expired(now)).is_some() {
+            if self
+                .store
+                .remove_if(&key, |_, v| v.is_expired(now))
+                .is_some()
+            {
                 removed += 1;
             }
         }

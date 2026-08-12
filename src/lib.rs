@@ -155,12 +155,7 @@ impl Cache {
     /// - Chave expirada → remove a entrada (expiração lazy) e devolve `default`.
     /// - Caso contrário → o objeto Python original, desserializado por `pickle`.
     #[pyo3(signature = (key, default=None))]
-    fn get(
-        &self,
-        py: Python<'_>,
-        key: &str,
-        default: Option<Py<PyAny>>,
-    ) -> PyResult<Py<PyAny>> {
+    fn get(&self, py: Python<'_>, key: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         match self.inner.get(key, now_ms()) {
             Some(bytes) => loads(py, &bytes),
             None => Ok(default.unwrap_or_else(|| py.None())),

@@ -1,7 +1,8 @@
 [package]
 name = "rust_py_cache"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
+license = "MIT"
 
 # Biblioteca de extensão para Python:
 #   - cdylib -> gera o .so/.dylib carregável pelo Python
