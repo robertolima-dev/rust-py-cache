@@ -1,74 +1,146 @@
-name: Release
-
-# Dispara ao publicar uma tag de versão (ex.: v0.1.0). Constrói as wheels para
-# todas as plataformas + sdist e publica no PyPI via Trusted Publishing (OIDC),
-# sem precisar guardar um token no repositório.
+# ─────────────────────────────────────────────────────────────────────────────
+# release.yml canônico dos `rust_py_*`  —  P3-1
 #
-# O `ci.yml` roda em push/PR, mas é um workflow *separado*: um push de tag ia
-# direto para build e publicação sem depender dele. O job `test` abaixo é o que
-# torna a publicação condicionada a uma suíte verde — publicar no PyPI é
-# irreversível, então não pode acontecer sobre código não verificado.
+# Um arquivo só por projeto: lint, teste, build da matriz, ensaio no TestPyPI e
+# publicação. Substitui o par `ci.yml` + `release.yml` que `cache` e
+# `rate_limit` mantinham, e que tinha um problema silencioso — ver "Por que um
+# workflow só", abaixo.
+#
+# Gerado a partir de `rust_py_template/.github/workflows/release.yml` em
+# 12/08/2026 — o `cache` é o primeiro projeto a adotar o formato unificado.
+# Correção feita aqui deve voltar para o template, senão a divergência
+# recomeça pelo mesmo caminho de sempre.
+#
+# ⚠️ NÃO RENOMEAR ESTE ARQUIVO. O trusted publisher cadastrado no PyPI amarra
+# `release.yml`; renomear quebra a publicação até o cadastro ser refeito.
+#
+# Substituiu o par `ci.yml` + `release.yml` que o `cache` mantinha.
+#
+# ── POR QUE UM WORKFLOW SÓ ───────────────────────────────────────────────────
+# `cache` e `rate_limit` tinham dois arquivos, e a divisão escondia uma
+# inversão: o `ci.yml` deles rodava a suíte RICA (multi-OS, Python 3.10–3.13)
+# em push/PR sem barrar nada, enquanto o `release.yml` barrava a publicação com
+# uma suíte MAGRA (ubuntu, 3.12). Ou seja, o portão do PyPI era o teste mais
+# fraco dos dois. `needs` não atravessa workflow — é a lição do P1-1, aqui numa
+# segunda forma.
+#
+# Este arquivo resolve juntando: a suíte rica é a que barra o release.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: CI / Release
+
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    tags: ["v*"]            # `v*`, nunca `*` — ver nota no job `release`
+  pull_request:
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
+env:
+  PACKAGE_NAME: rust-py-cache
+  # 2 manylinux + 2 musllinux + 1 windows + 2 macos. O `monitor` soma 4 do
+  # PyPy (11); o `scheduler`, com a matriz longa, chega a 15.
+  MIN_WHEELS: "7"
+
 jobs:
-  # O lint faz parte do portão de release, não de um workflow paralelo.
-  # Nos repositórios de workflow único, um `lint` vermelho ao lado de uma
-  # publicação bem-sucedida seria ruído difícil de ler — a leitura passa a ser
-  # inequívoca: vermelho significa que não publicou.
-  #
-  # A toolchain é fixa, não "stable": com `-D warnings`, um clippy mais novo
-  # no runner reprova código que ninguém tocou, e a CI ficaria vermelha por
-  # conta do calendário. Subir este número vira uma mudança deliberada.
+  # ── PORTÃO 1: lint ─────────────────────────────────────────────────────────
+  # Barra o release junto com o `test`. Nos repositórios de workflow único, um
+  # `lint` vermelho ao lado de uma publicação bem-sucedida seria ilegível — a
+  # leitura tem que ser inequívoca: vermelho significa que não publicou.
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Versão fixa, não "stable". Com `-D warnings`, um clippy mais novo no
+      # runner reprova código que ninguém tocou, e a CI fica vermelha por conta
+      # do calendário. Subir este número vira uma mudança deliberada.
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt
         run: cargo fmt --all -- --check
-      # clippy só checa tipos, não linka, então --all-features é seguro aqui
-      # (diferente do `cargo test`, que precisa de --no-default-features).
+      # clippy só checa tipos, não linka, então --all-features é seguro aqui —
+      # diferente do `cargo test`, que precisa de --no-default-features.
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # ── PORTÃO 2: teste ────────────────────────────────────────────────────────
+  # Nada é construído e nada chega ao PyPI antes disto passar. Publicação no
+  # PyPI é irreversível: um wheel ruim não pode ser substituído, só yankado.
   test:
-    name: Test (Rust + Python)
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # A matriz veio do `ci.yml` do `cache` e do `CI.yml` do `rate_limit`, que
+      # tinham a cobertura mais larga dos cinco — e que, por viverem em
+      # workflow separado, não barravam nada. Agora barram.
+      #
+      # O eixo de SO é o do `cache`, reduzido: ele rodava macOS em três versões
+      # de Python, o que dobrava a matriz para provar a mesma coisa. Uma versão
+      # em macOS basta para pegar o que ubuntu não pega (link da extensão,
+      # caminho de arquivo, comportamento de thread). O eixo de Python inteiro
+      # fica no ubuntu, que é onde ele importa.
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - name: cargo test
+          python-version: ${{ matrix.python-version }}
+      - uses: Swatinem/rust-cache@v2
+
+      # --no-default-features desliga `extension-module`, que manda o linker
+      # deixar os símbolos da libpython indefinidos. Correto para a wheel, mas
+      # produz um binário de teste que não linka no Linux.
+      #
+      # ⚠️ O `rate_limit` é o único sem seção `[features]` no Cargo.toml — lá
+      # o `extension-module` vem só de `[tool.maturin].features`, e a flag é
+      # inócua. Alinhar o Cargo.toml dele é item pendente.
+      - name: Rust unit tests
+        # Uma vez por SO basta: o core não muda com a versão do Python.
+        if: matrix.python-version == '3.12'
         env:
           PYO3_PYTHON: python
         run: cargo test --no-default-features --lib
+
+      # `pip install` aciona o backend maturin, compila a extensão e a instala
+      # no Python do runner. Ao contrário de `maturin develop`, não exige
+      # virtualenv — armadilha que custou um release do `monitor` (P1-9).
+      # Instalar não-editável faz os testes exercitarem o artefato que embarca.
       - name: Build, install the extension and run the Python tests
         run: |
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
           python -m pytest -q
 
-  # A matriz abaixo substitui um job `build` que rodava em ubuntu/macos/windows
-  # com `maturin build` puro. Aquilo publicava 3 wheels e o de Linux herdava a
-  # glibc do runner, em vez de passar pelo container manylinux. Quem estava em
-  # aarch64, em musl ou em Mac Intel caía no sdist — que exige toolchain Rust.
+  # ── BUILD ──────────────────────────────────────────────────────────────────
+  # Guardados por tag OU disparo manual: um push comum não precisa pagar a
+  # matriz inteira, mas o ensaio no TestPyPI precisa dos artefatos.
+  #
+  # `fail-fast: false` em todas as matrizes: sem isso, um alvo que cai CANCELA
+  # os irmãos. Em 12/08/2026 o build x86 do `scheduler` quebrou num 403 do
+  # vault.centos.org e levou junto o diagnóstico de armv7/s390x/ppc64le.
+  #
+  # Nenhum job de build passa `--find-interpreter`: com `abi3-py310` ele não
+  # produz nada a mais. Verificado — o `audit` publicava 7 wheels, todos abi3,
+  # com a flag ligada. É flag morto e confunde quem lê.
   linux:
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [test, lint]
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [lint, test]
     strategy:
+      fail-fast: false
       matrix:
         target: [x86_64, aarch64]
     steps:
@@ -77,8 +149,8 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist
-          # `auto` constrói dentro do container manylinux, então a wheel
-          # declara um piso de glibc portável em vez do da máquina de build.
+          # `auto` constrói dentro do container manylinux, para o wheel
+          # declarar um piso de glibc portável em vez do glibc do runner.
           manylinux: auto
       - uses: actions/upload-artifact@v4
         with:
@@ -87,9 +159,10 @@ jobs:
 
   musllinux:
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [test, lint]
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [lint, test]
     strategy:
+      fail-fast: false
       matrix:
         target: [x86_64, aarch64]
     steps:
@@ -106,8 +179,8 @@ jobs:
 
   windows:
     runs-on: windows-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [test, lint]
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [lint, test]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -124,9 +197,10 @@ jobs:
 
   macos:
     runs-on: macos-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [test, lint]
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [lint, test]
     strategy:
+      fail-fast: false
       matrix:
         target: [x86_64, aarch64]
     steps:
@@ -142,8 +216,8 @@ jobs:
 
   sdist:
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [test, lint]
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [lint, test]
     steps:
       - uses: actions/checkout@v4
       - uses: PyO3/maturin-action@v1
@@ -155,30 +229,84 @@ jobs:
           name: wheels-sdist
           path: dist
 
-  publish:
-    name: publish to PyPI
-    # Guarda além do gatilho: sem ela, um `workflow_dispatch` a partir de um
-    # branch publicaria no PyPI.
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [lint, test, linux, musllinux, windows, macos, sdist]
+  # ── ENSAIO ─────────────────────────────────────────────────────────────────
+  # Valida a troca OIDC inteira sem tocar no índice de produção. É onde um
+  # publisher mal cadastrado deve ser descoberto — no PyPI, um nome de arquivo
+  # publicado nunca pode ser reusado.
+  #
+  # ⚠️ Precisa do seu próprio publisher, cadastrado no TestPyPI (conta separada
+  # do PyPI), com environment `testpypi`.
+  #
+  # Sem verificação pós-upload de propósito: o que se valida aqui é a troca de
+  # token, e o TestPyPI expira distribuições — reprovar por um arquivo que o
+  # índice de teste descartou seria alarme falso.
+  publish-testpypi:
+    name: Publish to TestPyPI (ensaio)
     runs-on: ubuntu-latest
-    environment: pypi
+    if: github.event_name == 'workflow_dispatch'
+    needs: [lint, test, linux, musllinux, windows, macos, sdist]
+    environment: testpypi
     permissions:
-      id-token: write   # necessário para o Trusted Publishing (OIDC)
+      id-token: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
-          merge-multiple: true
           path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist
+          skip-existing: true
+
+  # ── PUBLICAÇÃO ─────────────────────────────────────────────────────────────
+  release:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    # SÓ TAG. Sem a cláusula de `workflow_dispatch` que os jobs de build têm —
+    # a assimetria é a proteção: disparo manual vai ao TestPyPI, só a tag chega
+    # ao índice de verdade.
+    #
+    # ⚠️ Isto depende do filtro `tags: ["v*"]` lá em cima. O `scheduler` usava
+    # `'*'`, e como esta guarda só checa `refs/tags/`, QUALQUER tag empurrada
+    # teria publicado. Corrigido em 12/08/2026.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [lint, test, linux, musllinux, windows, macos, sdist]
+
+    # Trusted publishing (OIDC): sem `secrets.PYPI_API_TOKEN`. O GitHub emite
+    # um JWT curto afirmando repositório, workflow e ref, e o PyPI o troca por
+    # um token de upload de poucos minutos, restrito a este projeto.
+    #
+    # ⚠️ Os três valores precisam bater EXATAMENTE com o publisher cadastrado
+    # em PyPI → Manage → Publishing:
+    #   owner/repo .... <owner>/<repo>
+    #   workflow ...... release.yml   (o NOME DO ARQUIVO, não o `name:` acima)
+    #   environment ... pypi
+    # Errar qualquer um dá `invalid-publisher`, que é falha segura: acontece na
+    # troca do token, depois de construir tudo e antes de qualquer arquivo sair
+    # do runner.
+    environment: pypi
+    permissions:
+      id-token: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install the verification dependency
+        run: python -m pip install --upgrade requests
 
       # Conferência antes de qualquer coisa sair do runner: publicar um
       # conjunto incompleto é pior que não publicar, porque o PyPI nunca deixa
       # reusar um nome de arquivo — uma versão meio-publicada só pode ser
-      # completada, nunca substituída.
+      # completada, nunca substituída. Aconteceu de verdade: `monitor` 0.4.0
+      # ficou com 37 de 45 arquivos e sem sdist (P1-9).
       - name: Verify the artifact set is complete
         run: |
           set -euo pipefail
@@ -186,18 +314,22 @@ jobs:
           test -n "$(find dist -name '*.tar.gz' -print -quit)" \
             || { echo "::error::sdist ausente — abortando antes de publicar"; exit 1; }
           wheels=$(find dist -name '*.whl' | wc -l)
-          echo "wheels: $wheels"
-          test "$wheels" -ge 7 \
-            || { echo "::error::só $wheels wheels; esperado >= 7 (2 linux, 2 musl, 1 win, 2 macos)"; exit 1; }
+          echo "wheels: $wheels (mínimo ${MIN_WHEELS})"
+          test "$wheels" -ge "${MIN_WHEELS}" \
+            || { echo "::error::só $wheels wheels; esperado >= ${MIN_WHEELS}"; exit 1; }
 
       # O PyPI devolve 500 transitório com frequência suficiente para importar,
       # e o upload é arquivo por arquivo: uma falha no meio deixa a versão
-      # publicada pela metade. `skip-existing` é o que torna a segunda
-      # tentativa segura — sem ele, ela morre nos arquivos que já subiram.
+      # publicada pela metade. `skip-existing` torna a segunda tentativa segura
+      # — sem ele, ela morre nos arquivos que já subiram.
       #
-      # São dois passos explícitos em vez de um wrapper de retry porque o
-      # trusted publishing (OIDC) exige a action oficial, que não dá para
-      # acionar por linha de comando.
+      # Dois passos explícitos em vez de um wrapper de retry porque o trusted
+      # publishing exige a action oficial, que não dá para acionar por linha de
+      # comando de dentro do `nick-fields/retry`.
+      #
+      # ⚠️ Se a primeira tentativa falhar por `invalid-publisher`, a segunda vai
+      # falhar igual — é erro de configuração, não transitório. Custa 45s de
+      # espera inútil; melhoria conhecida e ainda não feita.
       - name: Publish to PyPI (attempt 1)
         id: publish1
         continue-on-error: true
@@ -222,21 +354,22 @@ jobs:
       - name: Verify every file reached PyPI
         run: |
           set -euo pipefail
-          python -m pip install --quiet requests
           python - <<'PY'
           import os, sys, glob, time, requests
+          package = os.environ["PACKAGE_NAME"]
           version = os.environ["GITHUB_REF_NAME"].lstrip("v")
-          # Só .whl e .tar.gz: são os únicos tipos de arquivo que o PyPI hospeda.
+          # Só .whl e .tar.gz: os únicos tipos que o PyPI hospeda. O
           # `pypa/gh-action-pypi-publish` deixa um .publish.attestation por
-          # distribuição em dist/ depois de publicar (atestados PEP 740, que
-          # sobem junto do arquivo, não como arquivo próprio). Um glob amplo os
-          # conta como "faltando no PyPI" e reprova uma release que deu certo.
+          # distribuição em dist/ DEPOIS de publicar (atestados PEP 740, que
+          # sobem junto do arquivo e não como arquivo próprio). Um glob amplo
+          # os conta como "faltando" e reprova uma release que deu certo — foi
+          # o alarme falso da rate_limit 0.2.1 (P1-9).
           local = {
               os.path.basename(p)
               for pattern in ("dist/*.whl", "dist/*.tar.gz")
               for p in glob.glob(pattern)
           }
-          url = f"https://pypi.org/pypi/rust-py-cache/{version}/json"
+          url = f"https://pypi.org/pypi/{package}/{version}/json"
           for attempt in range(6):          # a API JSON do PyPI é cacheada
               response = requests.get(url, timeout=30)
               if response.status_code == 200:

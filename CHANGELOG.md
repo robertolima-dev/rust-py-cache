@@ -5,7 +5,46 @@ Todas as mudanças relevantes deste projeto são registradas aqui.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e o versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
 
-## [0.2.3] — não publicada
+## [0.2.4] — não publicada
+
+Adoção do `release.yml` unificado do template (**P3-1**). Nada muda no
+comportamento da biblioteca — mas muda, e bastante, o que precisa passar antes
+de uma versão chegar ao PyPI.
+
+### Corrigido
+
+- **O release era barrado pela suíte mais fraca das duas.** O projeto tinha
+  dois workflows, e a divisão escondia uma inversão:
+
+  | | rodava | barrava o release? |
+  | --- | --- | --- |
+  | `ci.yml` | ubuntu + macOS × Python 3.10/3.12/3.13 | **não** |
+  | `release.yml` | ubuntu × Python 3.12 | sim |
+
+  Ou seja, a suíte boa não protegia nada e o portão do PyPI era a magra.
+  `needs` não atravessa workflow — a mesma lição do P1-1, numa segunda forma.
+  Os dois arquivos ainda mantinham o job `lint` duplicado.
+
+  Agora é um workflow só, e quem barra a publicação é
+  **ubuntu × Python 3.10/3.11/3.12/3.13 + macOS × 3.12**.
+
+  ⚠️ O eixo de macOS foi reduzido de três versões de Python para uma. Rodar as
+  três dobrava a matriz para provar a mesma coisa; uma basta para pegar o que
+  o ubuntu não pega (link da extensão, caminhos, threads).
+
+### Adicionado
+
+- **Ensaio no TestPyPI** (`publish-testpypi`, por `workflow_dispatch`), que o
+  projeto não tinha. Valida a troca de token OIDC sem tocar no índice de
+  produção. ⚠️ Exige um publisher próprio cadastrado no TestPyPI.
+- **`fail-fast: false`** nas matrizes: um alvo que cai deixava de cancelar os
+  irmãos e apagar o diagnóstico deles.
+
+### Removido
+
+- **`.github/workflows/ci.yml`**, fundido no `release.yml`.
+
+## [0.2.3] - 2026-08-12
 
 Versão de empacotamento e qualidade: nada muda no comportamento da biblioteca.
 
