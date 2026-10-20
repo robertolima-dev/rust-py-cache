@@ -48,6 +48,21 @@ def test_lru_evicts_to_make_room():
     assert cache.stats()["evicted"] == 1
 
 
+def test_lru_evicts_in_batches_and_stays_bounded():
+    # max_size 320 => lote de 10 por varredura.
+    cache = Cache(max_size=320, eviction_policy="lru")
+    for i in range(320):
+        cache.set(f"k{i}", i)
+    cache.set("new", 1)
+    assert cache.stats()["evicted"] == 10
+    assert len(cache) == 311
+    assert cache.get("new") == 1
+    for i in range(5_000):
+        cache.set(f"x{i}", i)
+        assert len(cache) <= 320
+    assert cache.stats()["evicted"] % 10 == 0
+
+
 def test_lru_keeps_recently_used():
     cache = Cache(max_size=2, eviction_policy="lru")
     cache.set("a", 1)

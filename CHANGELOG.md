@@ -5,6 +5,38 @@ Todas as mudanças relevantes deste projeto são registradas aqui.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e o versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
 
+## [0.3.0] — não publicada
+
+Evicção LRU com custo amortizado O(1) (**P2-2**). Inclui também tudo o que
+estava na 0.2.4, que nunca chegou a ser publicada.
+
+### Alterado
+
+- **A evicção LRU passou a remover um lote, não uma entrada.** Até a 0.2.x,
+  achar a entrada menos recentemente usada varria o `DashMap` inteiro — e isso
+  acontecia a **cada** `set` de chave nova com o cache cheio, que é o regime
+  normal de um cache cheio sob escrita. Agora cada varredura remove
+  `max_size / 32` entradas (no mínimo 1), e a próxima só vem depois de outras
+  ~n/32 inserções. Medido com `max_size=100_000`: **~620 µs → ~1,6 µs** por
+  `set` com o cache cheio (com 10 000: ~70 µs → ~1,5 µs). O custo deixou de
+  crescer com o tamanho do cache.
+- A seleção acha o corte com `select_nth_unstable` sobre os carimbos de acesso
+  (sem clonar chaves nem ordenar) e remove com `remove_if`, que recheca o
+  carimbo: uma chave lida por outra thread no meio da varredura fica.
+- Um `Mutex` cobre **só** o caminho de evicção, para várias threads que acham o
+  cache cheio ao mesmo tempo não varrerem em paralelo. `get`/`set` comuns não o
+  tocam.
+
+### Compatibilidade
+
+- Nenhuma API mudou. O que muda de observável, e por isso o minor sobe: logo
+  depois de uma evicção o cache fica ~3% abaixo de `max_size` (antes ficava em
+  `max_size - 1`), e `stats()["evicted"]` cresce em lotes. Com `max_size < 64`
+  o lote é de 1 entrada e o comportamento é idêntico ao anterior.
+- Amostragem estilo Redis, que o backlog sugeria, foi descartada: exigiria
+  acesso aleatório às entradas, que o `DashMap` só expõe pela `raw-api` (tabela
+  interna do hashbrown, iteração `unsafe`).
+
 ## [0.2.4] — não publicada
 
 Adoção do `release.yml` unificado do template (**P3-1**). Nada muda no

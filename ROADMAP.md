@@ -36,16 +36,21 @@ the stages already shipped and what comes next.
 ### LRU eviction
 
 - ✅ `Cache(max_size=..., eviction_policy="lru")` evicts the **least-recently-used**
-  entry once the cap is hit (recency updated on every `get` hit). Default policy
+  entries once the cap is hit (recency updated on every `get` hit). Default policy
   is `"reject"` (backward compatible). Evictions are surfaced in `stats()` as an
   `evicted` counter.
+- ✅ **v0.3 — amortized O(1) eviction.** Evicts a batch of `max_size / 32` per
+  scan instead of one entry per scan, so a full cache under sustained writes no
+  longer pays an O(n) scan on every new key (~620 µs → ~1.6 µs per `set` at 100k
+  entries).
 
 ## Planned
 
-### v0.3 — LFU eviction
+### v0.4 — LFU eviction
 
 - 🔜 **Least-frequently-used** eviction policy as an alternative to LRU, selectable
-  at construction time (e.g. `Cache(max_size=..., policy="lfu")`).
+  at construction time (e.g. `Cache(max_size=..., policy="lfu")`). Reuses the
+  batch selection from v0.3, keyed on `hits` instead of `last_accessed_at`.
 
 ### v0.5 — Configurable serializer
 

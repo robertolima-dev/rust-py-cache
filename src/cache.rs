@@ -4,6 +4,8 @@
 //! de testar em Rust puro e para separar responsabilidades: `lib.rs` cuida da
 //! ponte com o Python; `cache.rs` cuida do armazenamento.
 
+use std::sync::Mutex;
+
 use dashmap::DashMap;
 
 use crate::entry::CacheEntry;
@@ -15,9 +17,13 @@ pub enum EvictionPolicy {
     /// Rejeita a escrita (`set` devolve `false`). Comportamento padrão.
     #[default]
     Reject,
-    /// Remove a entrada menos recentemente usada (LRU) para abrir espaço.
+    /// Remove as entradas menos recentemente usadas (LRU) para abrir espaço.
     Lru,
 }
+
+/// Fração de `max_size` removida de uma vez quando a LRU precisa abrir espaço
+/// (1/32 ≈ 3%, no mínimo 1 entrada). Ver [`RustCache::evict_lru_batch`].
+const EVICTION_BATCH_DIVISOR: usize = 32;
 
 /// Núcleo concorrente do cache.
 ///
@@ -37,6 +43,11 @@ pub struct RustCache {
     max_size: Option<usize>,
     /// Política aplicada quando o cache enche e chega uma chave nova.
     eviction_policy: EvictionPolicy,
+    /// Serializa só o caminho de evicção: quando várias threads encontram o
+    /// cache cheio ao mesmo tempo, uma varre e as outras, ao entrar, veem que
+    /// já há espaço e seguem — sem N varreduras simultâneas. Não é tocado no
+    /// caminho comum de `get`/`set`.
+    eviction_lock: Mutex<()>,
 }
 
 impl RustCache {
@@ -47,6 +58,7 @@ impl RustCache {
             stats: CacheStats::new(),
             max_size,
             eviction_policy,
+            eviction_lock: Mutex::new(()),
         }
     }
 
@@ -55,17 +67,67 @@ impl RustCache {
         self.eviction_policy
     }
 
-    /// Remove a entrada com o menor `last_accessed_at` (a "menos recentemente
-    /// usada"). Varre o mapa uma vez — O(n) só na evicção (caminho raro: cache
-    /// cheio + chave nova). Conta em `evicted`.
-    fn evict_lru(&self) {
-        let oldest = self
+    /// Abre espaço removendo, de uma vez, as `max / 32` (no mínimo 1) entradas
+    /// menos recentemente usadas. Conta cada uma em `evicted`.
+    ///
+    /// ## Por que em lote
+    ///
+    /// Achar a entrada mais antiga num `DashMap` exige varrer o mapa inteiro —
+    /// não há ordem nem acesso aleatório. Até a 0.2 isso acontecia a **cada**
+    /// `set` de chave nova com o cache cheio, que é o regime normal de um cache
+    /// cheio sob escrita: O(n) por inserção. Removendo ~3% por varredura, a
+    /// próxima varredura só vem depois de outras ~n/32 inserções — custo
+    /// amortizado O(1) (≈ 64 visitas por inserção), sem lock global no caminho
+    /// comum e sem `unsafe` para amostrar shards.
+    ///
+    /// Uma lista LRU exata exigiria um lock global em todo `get`, que é o que o
+    /// `DashMap` existe para evitar. A amostragem estilo Redis exigiria acesso
+    /// aleatório às entradas, que o `DashMap` só oferece pela `raw-api`
+    /// (tabela interna do hashbrown, iteração `unsafe`).
+    ///
+    /// ## Como
+    ///
+    /// 1. Coleta só os `last_accessed_at` (um `Vec<u64>`, sem clonar chaves) e
+    ///    acha o corte do lote com `select_nth_unstable` — O(n), sem ordenar.
+    /// 2. Coleta as chaves com acesso `<= corte` (até o tamanho do lote).
+    /// 3. Remove com `remove_if`, que **recheca** o carimbo: uma chave lida por
+    ///    outra thread entre as fases deixou de ser LRU e fica.
+    fn evict_lru_batch(&self, max: usize) {
+        let _guard = self
+            .eviction_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Outra thread pode ter aberto espaço enquanto esperávamos o lock.
+        if self.store.len() < max {
+            return;
+        }
+
+        let mut stamps: Vec<u64> = self
             .store
             .iter()
-            .min_by_key(|e| e.value().last_accessed_at)
-            .map(|e| e.key().clone());
-        if let Some(key) = oldest {
-            if self.store.remove(&key).is_some() {
+            .map(|e| e.value().last_accessed_at)
+            .collect();
+        if stamps.is_empty() {
+            return;
+        }
+        let batch = (max / EVICTION_BATCH_DIVISOR).clamp(1, stamps.len());
+        let (_, &mut cutoff, _) = stamps.select_nth_unstable(batch - 1);
+        drop(stamps);
+
+        let victims: Vec<String> = self
+            .store
+            .iter()
+            .filter(|e| e.value().last_accessed_at <= cutoff)
+            .take(batch)
+            .map(|e| e.key().clone())
+            .collect();
+
+        for key in victims {
+            if self
+                .store
+                .remove_if(&key, |_, v| v.last_accessed_at <= cutoff)
+                .is_some()
+            {
                 self.stats.record_evicted();
             }
         }
@@ -79,14 +141,15 @@ impl RustCache {
     ///
     /// Sobrescrever uma chave existente sempre é permitido. Para uma chave
     /// **nova** com o cache cheio (`max_size`): com `Reject` devolve `false` sem
-    /// inserir; com `Lru` remove a entrada menos recentemente usada e prossegue.
+    /// inserir; com `Lru` remove um lote das menos recentemente usadas (ver
+    /// [`Self::evict_lru_batch`]) e prossegue.
     /// Devolve `true` quando a entrada foi (ou seria) gravada.
     pub fn set(&self, key: String, value: Vec<u8>, expires_at: Option<u64>, now: u64) -> bool {
         if let Some(max) = self.max_size {
             if self.store.len() >= max && !self.store.contains_key(&key) {
                 match self.eviction_policy {
                     EvictionPolicy::Reject => return false,
-                    EvictionPolicy::Lru => self.evict_lru(),
+                    EvictionPolicy::Lru => self.evict_lru_batch(max),
                 }
             }
         }
@@ -312,6 +375,45 @@ mod tests {
         assert!(c.get("b", NOW + 11).is_none());
         assert!(c.get("a", NOW + 11).is_some());
         assert!(c.get("c", NOW + 11).is_some());
+    }
+
+    #[test]
+    fn lru_evicts_a_batch_of_the_oldest() {
+        // max 64 => lote de 64/32 = 2.
+        let c = RustCache::new(Some(64), EvictionPolicy::Lru);
+        for i in 0..64u64 {
+            c.set(format!("k{i}"), b"v".to_vec(), None, NOW + i);
+        }
+        // k0 e k1 são as mais antigas; tocar em k0 a torna a mais recente.
+        assert!(c.get("k0", NOW + 100).is_some());
+        assert!(c.set("new".into(), b"v".to_vec(), None, NOW + 101));
+        assert_eq!(c.stats().evicted, 2);
+        assert_eq!(c.len(), 63);
+        assert!(c.exists("k0", NOW + 102));
+        assert!(!c.exists("k1", NOW + 102));
+        assert!(!c.exists("k2", NOW + 102));
+        assert!(c.exists("k3", NOW + 102));
+        assert!(c.exists("new", NOW + 102));
+    }
+
+    #[test]
+    fn lru_amortizes_the_scan() {
+        // Escrita sustentada com o cache cheio: o número de varreduras é
+        // ~inserções / lote, não uma por inserção.
+        let max = 1_024;
+        let c = RustCache::new(Some(max), EvictionPolicy::Lru);
+        for i in 0..(max as u64 * 4) {
+            c.set(format!("k{i}"), b"v".to_vec(), None, NOW + i);
+            assert!(c.len() <= max);
+        }
+        let evicted = c.stats().evicted;
+        let batch = (max / EVICTION_BATCH_DIVISOR) as u64;
+        assert_eq!(evicted % batch, 0, "sempre um lote cheio por varredura");
+        // 3 * max inserções além da capacidade => ~3 * 32 varreduras.
+        assert!(evicted / batch <= 3 * EVICTION_BATCH_DIVISOR as u64 + 1);
+        // As sobreviventes são as mais recentes.
+        assert!(c.exists(&format!("k{}", max as u64 * 4 - 1), NOW));
+        assert!(!c.exists("k0", NOW));
     }
 
     #[test]

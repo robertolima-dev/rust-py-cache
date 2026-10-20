@@ -18,7 +18,7 @@ pub struct CacheEntry {
     pub expires_at: Option<u64>,
     /// Quando a entrada foi criada (epoch-ms).
     pub created_at: u64,
-    /// Último acesso por `get` bem-sucedido (epoch-ms) — base para LRU futuro.
+    /// Último acesso por `get` bem-sucedido (epoch-ms) — base da evicção LRU.
     pub last_accessed_at: u64,
     /// Quantas vezes esta entrada foi lida — base para LFU futuro.
     pub hits: u64,
